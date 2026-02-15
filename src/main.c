@@ -19,6 +19,7 @@
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
+#include "ble_parser.h"
 
 static const char *TAG = "MAIN";
 
@@ -29,6 +30,8 @@ static const char *TAG = "MAIN";
 #define DISCOVERY_PREFIX "SATMASTER"
 #define MDNS_HOSTNAME "ble-master"
 #define MDNS_QUERY_INTERVAL_MS 5000
+#define NAME_CACHE_SIZE 64
+#define MAX_NAME_LEN 32
 
 static bool wifi_connected = false;
 static char server_url[128] = DEFAULT_SERVER_URL;
@@ -36,6 +39,53 @@ static bool server_url_set = false;
 #if HAVE_MDNS
 static bool mdns_started = false;
 #endif
+
+typedef struct {
+    uint8_t addr[6];
+    char name[MAX_NAME_LEN];
+    bool has_name;
+} name_cache_entry_t;
+
+static name_cache_entry_t name_cache[NAME_CACHE_SIZE];
+
+static name_cache_entry_t *get_name_cache(const uint8_t *addr) {
+    for (int i = 0; i < NAME_CACHE_SIZE; i++) {
+        if (name_cache[i].has_name && memcmp(name_cache[i].addr, addr, 6) == 0) {
+            return &name_cache[i];
+        }
+    }
+    for (int i = 0; i < NAME_CACHE_SIZE; i++) {
+        if (!name_cache[i].has_name) {
+            memcpy(name_cache[i].addr, addr, 6);
+            return &name_cache[i];
+        }
+    }
+    return NULL;
+}
+
+static void name_cache_update(const uint8_t *addr, const char *name) {
+    if (!addr || !name || name[0] == '\0') {
+        return;
+    }
+    name_cache_entry_t *entry = get_name_cache(addr);
+    if (!entry) {
+        return;
+    }
+    if (entry->has_name) {
+        return;
+    }
+    snprintf(entry->name, sizeof(entry->name), "%s", name);
+    entry->has_name = true;
+}
+
+static const char *name_cache_lookup(const uint8_t *addr) {
+    name_cache_entry_t *entry = get_name_cache(addr);
+    if (!entry || !entry->has_name) {
+        return NULL;
+    }
+    return entry->name;
+}
+
 
 static void update_server_url(const char *ip, int port, const char *source) {
     if (!ip || ip[0] == '\0') {
@@ -133,7 +183,8 @@ static void json_escape_string(const char *in, char *out, size_t out_size) {
     out[j] = '\0';
 }
 
-static void send_ble_data(const char *mac, int8_t rssi, const uint8_t *data, uint8_t len, const char *name) {
+static void send_ble_data(const char *mac, int8_t rssi, const uint8_t *data, uint8_t len,
+                          const char *name, const ble_sensor_data_t *sensor) {
     if (!wifi_connected) return;
     
     char payload[512];
@@ -145,16 +196,33 @@ static void send_ble_data(const char *mac, int8_t rssi, const uint8_t *data, uin
         sprintf(hex_data + (i * 2), "%02X", data[i]);
     }
     
+    size_t used = snprintf(payload, sizeof(payload),
+                           "{\"mac\":\"%s\",\"rssi\":%d,\"data\":\"%s\"",
+                           mac, rssi, hex_data);
+
     if (name && name[0] != '\0') {
         json_escape_string(name, name_escaped, sizeof(name_escaped));
-        snprintf(payload, sizeof(payload),
-            "{\"mac\":\"%s\",\"rssi\":%d,\"data\":\"%s\",\"name\":\"%s\"}",
-            mac, rssi, hex_data, name_escaped);
-    } else {
-        snprintf(payload, sizeof(payload),
-            "{\"mac\":\"%s\",\"rssi\":%d,\"data\":\"%s\"}",
-            mac, rssi, hex_data);
+        used += snprintf(payload + used, sizeof(payload) - used,
+                         ",\"name\":\"%s\"", name_escaped);
     }
+
+    if (sensor && sensor->has_data) {
+        used += snprintf(payload + used, sizeof(payload) - used,
+                         ",\"type\":\"%s\",\"temp\":%.2f,\"hum\":%.2f",
+                         sensor->device_type, sensor->temperature, sensor->humidity);
+        if (sensor->battery_pct > 0) {
+            used += snprintf(payload + used, sizeof(payload) - used,
+                             ",\"bat\":%u", sensor->battery_pct);
+        }
+        if (sensor->battery_mv > 0) {
+            used += snprintf(payload + used, sizeof(payload) - used,
+                             ",\"bat_mv\":%u", sensor->battery_mv);
+        }
+    }
+
+    snprintf(payload + used, sizeof(payload) - used, "}");
+
+    ESP_LOGI(TAG, "TX payload: %s", payload);
     
     esp_http_client_config_t config = {
         .url = server_url,
@@ -198,6 +266,53 @@ static bool has_payload_content(const uint8_t *data, uint8_t len) {
     return false;
 }
 
+static bool parse_sensor_data_from_adv(const uint8_t *data, uint8_t len, ble_sensor_data_t *sensor) {
+    if (!data || len == 0 || !sensor) {
+        return false;
+    }
+
+    memset(sensor, 0, sizeof(ble_sensor_data_t));
+    sensor->has_data = false;
+    strncpy(sensor->device_type, "Unknown", sizeof(sensor->device_type) - 1);
+
+    uint8_t i = 0;
+    while (i + 1 < len) {
+        uint8_t field_len = data[i];
+        if (field_len == 0) break;
+        if (i + field_len >= len + 1) {
+            break;
+        }
+        uint8_t type = data[i + 1];
+        const uint8_t *payload = &data[i + 2];
+        uint8_t payload_len = field_len - 1;
+
+        if (type == 0x16 && payload_len >= 2) {
+            uint16_t uuid = payload[0] | (payload[1] << 8);
+            if (uuid == 0x181A) {
+                if (ble_parse_pvvx_format(payload, payload_len, sensor) ||
+                    ble_parse_atc_format(payload, payload_len, sensor)) {
+                    return true;
+                }
+            } else if (uuid == 0xFCD2) {
+                if (ble_parse_bthome_v2_format(payload, payload_len, sensor)) {
+                    return true;
+                }
+            }
+        } else if (type == 0xFF && payload_len >= 2) {
+            uint16_t company_id = payload[0] | (payload[1] << 8);
+            if (company_id == 0xFE95 && payload_len > 2) {
+                if (ble_parse_mibeacon_format(payload + 2, payload_len - 2, sensor)) {
+                    return true;
+                }
+            }
+        }
+
+        i += field_len + 1;
+    }
+
+    return false;
+}
+
 static void discovery_listen_task(void *param) {
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0) {
@@ -238,6 +353,7 @@ static void discovery_listen_task(void *param) {
             char ip[16] = {0};
             int port = 80;
             if (sscanf(rx + strlen(DISCOVERY_PREFIX), " %15s %d", ip, &port) >= 1) {
+                ESP_LOGI(TAG, "Discovery found hub -> %s:%d", ip, port);
                 update_server_url(ip, port, "Discovery");
             }
         } else {
@@ -268,6 +384,11 @@ static void mdns_query_task(void *param) {
                     char ip[16];
                     ip4addr_ntoa_r(&addr, ip, sizeof(ip));
                     update_server_url(ip, 80, "mDNS");
+                    ESP_LOGI(TAG, "mDNS found %s -> %s", MDNS_HOSTNAME, ip);
+                } else if (err == ESP_ERR_NOT_FOUND) {
+                    ESP_LOGI(TAG, "mDNS not found: %s", MDNS_HOSTNAME);
+                } else {
+                    ESP_LOGW(TAG, "mDNS query failed for %s: %s", MDNS_HOSTNAME, esp_err_to_name(err));
                 }
             }
         }
@@ -293,10 +414,25 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
             adv_name[copy_len] = '\0';
         }
 
+        if (adv_name[0] != '\0') {
+            name_cache_update(event->disc.addr.val, adv_name);
+        }
+
+        const char *cached_name = NULL;
+        if (adv_name[0] == '\0') {
+            cached_name = name_cache_lookup(event->disc.addr.val);
+        }
+        (void)cached_name;
+
         if (has_payload_content(event->disc.data, event->disc.length_data)) {
+            ble_sensor_data_t sensor_data;
+            bool parsed = parse_sensor_data_from_adv(event->disc.data,
+                                                    event->disc.length_data,
+                                                    &sensor_data);
             send_ble_data(mac, event->disc.rssi,
                          event->disc.data, event->disc.length_data,
-                         adv_name[0] != '\0' ? adv_name : NULL);
+                         adv_name[0] != '\0' ? adv_name : cached_name,
+                         parsed ? &sensor_data : NULL);
         }
     }
     return 0;
@@ -306,16 +442,28 @@ static void ble_scan_task(void *param) {
     ESP_LOGI(TAG, "BLE scan started");
     
     struct ble_gap_disc_params disc_params = {
-        .itvl = 0x10,
-        .window = 0x10,
+        .itvl = 0x50,
+        .window = 0x30,
         .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
         .limited = 0,
         .passive = 0, // Active scan, jotta saadaan scan response (nimi)
         .filter_duplicates = 0,
     };
-    
+
     while (1) {
-        ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params, ble_gap_event, NULL);
+        uint8_t addr_type = 0;
+        int rc = ble_hs_id_infer_auto(0, &addr_type);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "BLE addr_type infer epäonnistui: %d", rc);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        rc = ble_gap_disc(addr_type, BLE_HS_FOREVER, &disc_params, ble_gap_event, NULL);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "BLE scan start failed: %d", rc);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

@@ -1,5 +1,7 @@
 # BLE Satellite (ESP32-C3)
 
+pio device monitor -b 115200
+
 ESP32-C3 BLE satellite device that scans for BLE advertisements and forwards data to a master hub via HTTP.
 
 ## Hardware
