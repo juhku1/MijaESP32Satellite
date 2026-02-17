@@ -1,8 +1,16 @@
 # BLE Satellite (ESP32-C3)
 
+![Satellite board and Mijia sensor](satellitekuva.jpg)
+
 pio device monitor -b 115200
 
 ESP32-C3 BLE satellite device that scans for BLE advertisements and forwards data to a master hub via HTTP.
+
+**English (summary)**: This firmware is a satellite for the MijaESP32Hub master and is not standalone. It only forwards BLE advertisements to the hub.
+
+**Suomeksi (tiivistelmä)**: Tämä on satelliitti MijaESP32Hub‑hubille, eikä toimi itsenäisesti. Se vain välittää BLE‑mainosdatan hubille.
+
+**Photo hardware**: Satellite board is **ESP32-C3-DevKitM-1**. The BLE sensor is a **Xiaomi Mijia thermometer** running custom firmware (PVVX / ATC / BTHome v2 compatible).
 
 ## Hardware
 - **Board**: ESP32-C3-DevKitM-1
@@ -31,17 +39,22 @@ ESP32-C3 BLE satellite device that scans for BLE advertisements and forwards dat
 - **Payload**: Includes MAC address, RSSI, manufacturer data, and device name (if available)
 
 ## Data Format
-POSTs JSON array to master's `/api/satellite-data` endpoint:
+POSTs a JSON object to master's `/api/satellite-data` endpoint:
 ```json
-[
-  {
-    "mac": "AA:BB:CC:DD:EE:FF",
-    "rssi": -65,
-    "mfg_data": "0100AABBCCDD",
-    "name": "DeviceName"
-  }
-]
+{
+  "mac": "AA:BB:CC:DD:EE:FF",
+  "rssi": -65,
+  "data": "0201061AFF...",
+  "name": "DeviceName",
+  "type": "pvvx",
+  "temp": 24.9,
+  "hum": 24.0,
+  "bat": 87,
+  "bat_mv": 3000
+}
 ```
+
+Fields `name`, `type`, `temp`, `hum`, `bat`, and `bat_mv` are optional and included when available.
 
 ## Building & Flashing
 
